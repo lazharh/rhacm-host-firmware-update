@@ -38,13 +38,11 @@ rsync -a --delete \
 
 # Scrub cleartext password values in destination YAML only.
 # Leaves Jinja references like password: "{{ hub_password }}" untouched.
-scrub_file() {
+scrub_passwords() {
   local f="$1"
   [[ -f "${f}" ]] || return 0
-  # Portable in-place edit
   local tmp
   tmp="$(mktemp)"
-  # Clear hub/spoke/password scalars; skip Jinja "{{ ... }}" references.
   sed -E \
     -e 's/^([[:space:]]*hub_password:[[:space:]]*).+$/\1""/' \
     -e 's/^([[:space:]]*spoke_password:[[:space:]]*).+$/\1""/' \
@@ -52,13 +50,30 @@ scrub_file() {
     -e "s/^([[:space:]]*password:[[:space:]]*)'[^{']*'/\1''/" \
     "${f}" > "${tmp}"
   mv "${tmp}" "${f}"
-  echo "  scrubbed: ${f#${DEST_DIR}/}"
+  echo "  scrubbed passwords: ${f#${DEST_DIR}/}"
 }
 
-echo "Scrubbing cleartext passwords in destination..."
+# Sanitize local paths / usernames in ansible.cfg (destination only).
+scrub_ansible_cfg() {
+  local f="${DEST_DIR}/ansible.cfg"
+  [[ -f "${f}" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  # remote_user=<login> -> your_username
+  # /home/<login>/... -> $HOME/...
+  sed -E \
+    -e 's/^(remote_user=).+$/\1your_username/' \
+    -e "s|${HOME}|\$HOME|g" \
+    -e 's|/home/[^/:[:space:]]+|\$HOME|g' \
+    "${f}" > "${tmp}"
+  mv "${tmp}" "${f}"
+  echo "  scrubbed ansible.cfg: remote_user -> your_username, home paths -> \$HOME"
+}
+
+echo "Scrubbing secrets / local paths in destination..."
 shopt -s nullglob
 for f in "${DEST_DIR}"/vars/*.yml "${DEST_DIR}"/vars/*.yaml; do
-  scrub_file "${f}"
+  scrub_passwords "${f}"
 done
 for f in \
   "${DEST_DIR}"/roles/*/defaults/main.yml \
@@ -66,10 +81,11 @@ for f in \
   "${DEST_DIR}"/roles/defaults/main.yml \
   "${DEST_DIR}"/roles/defaults/main.yaml
 do
-  scrub_file "${f}"
+  scrub_passwords "${f}"
 done
 shopt -u nullglob
+scrub_ansible_cfg
 
 echo "Done. Review before commit:"
-echo "  cd ${DEST_DIR} && git status && git diff -- vars/"
-echo "Source lab passwords were not modified."
+echo "  cd ${DEST_DIR} && git status && git diff -- vars/ ansible.cfg"
+echo "Source lab files were not modified."
