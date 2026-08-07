@@ -27,7 +27,9 @@ echo "  to:   ${DEST_DIR}"
 
 mkdir -p "${DEST_DIR}"
 
-rsync -a --delete \
+# No --delete: update/add the same project files, keep dest-only files
+# (README, LICENSE, CI, notes, .git, etc.).
+rsync -a \
   --exclude '.git/' \
   --exclude '.gitignore' \
   --exclude '__pycache__/' \
@@ -36,9 +38,40 @@ rsync -a --delete \
   --exclude '*.retry' \
   "${SRC_DIR}/" "${DEST_DIR}/"
 
-# Scrub cleartext password values in destination YAML only.
+# Scrub lab-specific values in destination vars YAML.
 # Leaves Jinja references like password: "{{ hub_password }}" untouched.
-scrub_passwords() {
+# Skips commented lines (leading #).
+scrub_vars_file() {
+  local f="$1"
+  [[ -f "${f}" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  sed -E \
+    -e 's/^([[:space:]]*hub_password:[[:space:]]*).+$/\1""/' \
+    -e 's/^([[:space:]]*spoke_password:[[:space:]]*).+$/\1""/' \
+    -e 's/^([[:space:]]*password:[[:space:]]*)"[^{"]*"/\1""/' \
+    -e "s/^([[:space:]]*password:[[:space:]]*)'[^{']*'/\1''/" \
+    -e 's/^([[:space:]]*hub_username:[[:space:]]*).+$/\1"your_username"/' \
+    -e 's/^([[:space:]]*spoke_username:[[:space:]]*).+$/\1"your_username"/' \
+    -e 's/^([[:space:]]*username:[[:space:]]*)"[^{"]*"/\1"your_username"/' \
+    -e "s/^([[:space:]]*username:[[:space:]]*)'[^{']*'/\1'your_username'/" \
+    -e 's/^([[:space:]]*hub_api_url:[[:space:]]*).+$/\1"https:\/\/api.your-hub.example.com:6443"/' \
+    -e 's/^([[:space:]]*spoke_api_url:[[:space:]]*).+$/\1"https:\/\/api.your-spoke.example.com:6443"/' \
+    -e 's/^([[:space:]]*api_url:[[:space:]]*).+$/\1"https:\/\/api.your-spoke.example.com:6443"/' \
+    -e 's/^([[:space:]]*cluster_namespace:[[:space:]]*).+$/\1your-cluster-namespace/' \
+    -e 's/^([[:space:]]*-[[:space:]]*namespace:[[:space:]]*).+$/\1your-cluster-namespace/' \
+    -e 's/^([[:space:]]*namespace:[[:space:]]*).+$/\1your-cluster-namespace/' \
+    -e 's/^([[:space:]]*(-[[:space:]]*)?bmh_name:[[:space:]]*).+$/\1master-0.your-spoke.example.com/' \
+    -e 's/^([[:space:]]*(-[[:space:]]*)?spoke_node_name:[[:space:]]*).+$/\1master-0.your-spoke.example.com/' \
+    -e 's/^([[:space:]]*bios_firmware_url:[[:space:]]*).+$/\1"https:\/\/your-firmware-server.example.com\/path\/to\/bios"/' \
+    -e 's/^([[:space:]]*bmc_firmware_url:[[:space:]]*).+$/\1"https:\/\/your-firmware-server.example.com\/path\/to\/bmc"/' \
+    "${f}" > "${tmp}"
+  mv "${tmp}" "${f}"
+  echo "  scrubbed vars: ${f#${DEST_DIR}/}"
+}
+
+# Password-only scrub for role defaults (keep empty firmware URL defaults).
+scrub_passwords_only() {
   local f="$1"
   [[ -f "${f}" ]] || return 0
   local tmp
@@ -73,7 +106,7 @@ scrub_ansible_cfg() {
 echo "Scrubbing secrets / local paths in destination..."
 shopt -s nullglob
 for f in "${DEST_DIR}"/vars/*.yml "${DEST_DIR}"/vars/*.yaml; do
-  scrub_passwords "${f}"
+  scrub_vars_file "${f}"
 done
 for f in \
   "${DEST_DIR}"/roles/*/defaults/main.yml \
@@ -81,7 +114,7 @@ for f in \
   "${DEST_DIR}"/roles/defaults/main.yml \
   "${DEST_DIR}"/roles/defaults/main.yaml
 do
-  scrub_passwords "${f}"
+  scrub_passwords_only "${f}"
 done
 shopt -u nullglob
 scrub_ansible_cfg

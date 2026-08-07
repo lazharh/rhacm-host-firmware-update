@@ -6,8 +6,8 @@
 # - Nodes in the same spoke are updated one at a time.
 # - Optional per-node bios_firmware_url / bmc_firmware_url override the spoke defaults.
 
-hub_api_url: "https://api.lzhacm.se-lab.eng.rdu2.dc.redhat.com:6443"
-hub_username: "kubeadmin"
+hub_api_url: "https://api.your-hub.example.com:6443"
+hub_username: "your_username"
 hub_password: ""
 
 # Global flags / timeouts (role defaults apply if omitted)
@@ -17,15 +17,15 @@ uncordon_after_update: true
 
 spokes:
   # Example Dell SNO — copy/adjust entries per cluster
-  - namespace: sno-hnn3sy3
-    api_url: "https://api.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com:6443"
-    username: "kubeadmin"
+  - namespace: your-cluster-namespace
+    api_url: "https://api.your-spoke.example.com:6443"
+    username: "your_username"
     password: ""
-    bios_firmware_url: "http://refarch.se-apps.redhat.com//pub/firmware/dell/BIOS_DCFN9_WN64_1.21.1.EXE"
-    bmc_firmware_url: "http://refarch.se-apps.redhat.com//pub/firmware/dell/iDRAC_7.30.30.51_A00/firmimgFIT.d9"
+    bios_firmware_url: "https://your-firmware-server.example.com/path/to/bios"
+    bmc_firmware_url: "https://your-firmware-server.example.com/path/to/bmc"
     nodes:
-      - bmh_name: master-0.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com
-        spoke_node_name: master-0.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com
+      - bmh_name: master-0.your-spoke.example.com
+        spoke_node_name: master-0.your-spoke.example.com
 
   # Add another spoke (different hardware/firmware) like this:
   # - namespace: sno-other
