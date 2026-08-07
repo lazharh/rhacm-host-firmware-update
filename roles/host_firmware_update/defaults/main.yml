@@ -1,0 +1,31 @@
+---
+# Wait timings (firmware updates often need multiple reboots + BMC reclaim)
+change_detected_retries: 30
+change_detected_delay: 10
+# ~2h for IPA/servicing / BMC flash teardown
+servicing_retries: 240
+servicing_delay: 30
+
+# After reboot.metal3.io: give BMO time to start before polling "OK"/"Ready"
+post_reboot_settle_seconds: 300
+
+# After BMH leaves servicing, wait for spoke API/node Ready (SNO can take a long time)
+spoke_ready_retries: 240
+spoke_ready_delay: 30
+
+# After spoke is Ready, keep polling BMH while iDRAC comes back from BMC flash
+bmc_recover_retries: 60
+bmc_recover_delay: 30
+
+# Set true only when you intend to reboot and apply firmware
+trigger_reboot: true
+
+# After success, remove allow-provisioned-host-management so RHACM re-pauses BMH
+restore_rhacm_pause: true
+
+# Uncordon after update (article leaves this implicit; recommended for day-2)
+uncordon_after_update: true
+
+# Optional; empty means skip that component (at least one URL required)
+bios_firmware_url: ""
+bmc_firmware_url: ""

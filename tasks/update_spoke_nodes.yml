@@ -1,0 +1,34 @@
+---
+# Update each node in one spoke, one at a time.
+# Expects: spoke (dict), hub_auth_result, hub_* globals / role defaults.
+
+- name: "Validate spoke entry ({{ spoke.namespace }})"
+  ansible.builtin.assert:
+    that:
+      - spoke.namespace is defined and (spoke.namespace | length > 0)
+      - spoke.api_url is defined and (spoke.api_url | length > 0)
+      - spoke.username is defined and (spoke.username | length > 0)
+      - spoke.password is defined and (spoke.password | length > 0)
+      - spoke.nodes is defined and (spoke.nodes | length > 0)
+    fail_msg: >-
+      Spoke {{ spoke.namespace | default('?') }} needs namespace, api_url, username,
+      password, and nodes[]. Firmware URLs must be set on the spoke and/or each node
+      (role validates at least one of bios/bmc is present).
+
+
+- name: "Update node in {{ spoke.namespace }} (one at a time) — {{ node.bmh_name }}"
+  ansible.builtin.include_role:
+    name: host_firmware_update
+  vars:
+    cluster_namespace: "{{ spoke.namespace }}"
+    spoke_api_url: "{{ spoke.api_url }}"
+    spoke_username: "{{ spoke.username }}"
+    spoke_password: "{{ spoke.password }}"
+    bmh_name: "{{ node.bmh_name }}"
+    spoke_node_name: "{{ node.spoke_node_name }}"
+    bios_firmware_url: "{{ node.bios_firmware_url | default(spoke.bios_firmware_url | default('')) }}"
+    bmc_firmware_url: "{{ node.bmc_firmware_url | default(spoke.bmc_firmware_url | default('')) }}"
+  loop: "{{ spoke.nodes }}"
+  loop_control:
+    loop_var: node
+    label: "{{ node.bmh_name }}"

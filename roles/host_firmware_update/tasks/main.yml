@@ -1,0 +1,468 @@
+---
+# Single-node firmware update via RHACM hub Metal3 + spoke Ready checks.
+# Expects: hub_auth_result already set; flat vars for one BMH/node.
+
+- name: Validate required variables ({{ bmh_name | default('?') }})
+  ansible.builtin.assert:
+    that:
+      - cluster_namespace | length > 0
+      - bmh_name | length > 0
+      - spoke_node_name | length > 0
+      - hub_api_url | length > 0
+      - hub_username | length > 0
+      - hub_password | length > 0
+      - spoke_api_url | length > 0
+      - spoke_username | length > 0
+      - spoke_password | length > 0
+      - hub_auth_result.k8s_auth.api_key is defined
+      - (bios_firmware_url | default('') | length > 0) or (bmc_firmware_url | default('') | length > 0)
+    fail_msg: >-
+      Set cluster_namespace, bmh_name, spoke_node_name, hub_* / spoke_*
+      credentials, hub_auth_result, and at least one of bios_firmware_url or bmc_firmware_url.
+
+- name: Build HostFirmwareComponents updates list ({{ bmh_name }})
+  ansible.builtin.set_fact:
+    hfc_updates: >-
+      {{
+        (
+          [{'component': 'bios', 'url': bios_firmware_url}]
+          if (bios_firmware_url | default('') | length > 0) else []
+        )
+        +
+        (
+          [{'component': 'bmc', 'url': bmc_firmware_url}]
+          if (bmc_firmware_url | default('') | length > 0) else []
+        )
+      }}
+
+- name: Authenticate to spoke OpenShift using username/password ({{ spoke_node_name }})
+  kubernetes.core.k8s_auth:
+    host: "{{ spoke_api_url }}"
+    password: "{{ spoke_password }}"
+    username: "{{ spoke_username }}"
+    state: present
+    validate_certs: false
+  register: spoke_auth_result
+  when: spoke_username != "" and spoke_password != "" and spoke_api_url != ""
+
+# ------------------------------------------------------------------
+# 1. Check initial BMH annotations (hub)
+# ------------------------------------------------------------------
+- name: "1. Read BareMetalHost annotations on hub ({{ bmh_name }})"
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: bmh_before
+
+- name: "1. Fail if BareMetalHost was not found ({{ bmh_name }})"
+  ansible.builtin.assert:
+    that:
+      - bmh_before.resources | length == 1
+    fail_msg: "BMH {{ bmh_name }} not found in {{ cluster_namespace }} on the hub."
+
+- name: "1. Show current BMH annotations ({{ bmh_name }})"
+  ansible.builtin.debug:
+    var: bmh_before.resources[0].metadata.annotations
+
+- name: "1. Capture BMH annotation flags ({{ bmh_name }})"
+  ansible.builtin.set_fact:
+    bmh_annotations: "{{ bmh_before.resources[0].metadata.annotations | default({}) }}"
+    has_remove_agent_annotation: >-
+      {{ 'bmac.agent-install.openshift.io/remove-agent-and-node-on-delete'
+         in (bmh_before.resources[0].metadata.annotations | default({})) }}
+    has_reboot_annotation: >-
+      {{ 'reboot.metal3.io'
+         in (bmh_before.resources[0].metadata.annotations | default({})) }}
+
+- name: "1. Fail if reboot.metal3.io annotation is already present ({{ bmh_name }})"
+  ansible.builtin.assert:
+    that:
+      - not (has_reboot_annotation | bool)
+    fail_msg: >-
+      BMH {{ bmh_name }} already has reboot.metal3.io. A prior reboot/servicing
+      request may still be pending. Wait till the node complete Rebooting or Remove it and re-run:
+      oc annotate bmh -n {{ cluster_namespace }} {{ bmh_name }} reboot.metal3.io-
+
+# ------------------------------------------------------------------
+# 2. Annotate BMH for provisioned-host management (hub)
+# ------------------------------------------------------------------
+- name: "2. Remove conflicting remove-agent-and-node-on-delete annotation ({{ bmh_name }})"
+  when: has_remove_agent_annotation | bool
+  kubernetes.core.k8s:
+    state: patched
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    definition:
+      metadata:
+        annotations:
+          bmac.agent-install.openshift.io/remove-agent-and-node-on-delete: null
+
+- name: "2. Allow provisioned host management (clears paused/detached) ({{ bmh_name }})"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    definition:
+      metadata:
+        annotations:
+          bmac.agent-install.openshift.io/allow-provisioned-host-management: ""
+
+- name: "2. Re-read BMH annotations after management enablement ({{ bmh_name }})"
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: bmh_managed
+
+- name: "2. Confirm paused/detached annotations were cleared ({{ bmh_name }})"
+  ansible.builtin.assert:
+    that:
+      - >-
+        'baremetalhost.metal3.io/paused'
+        not in (bmh_managed.resources[0].metadata.annotations | default({}))
+      - >-
+        'baremetalhost.metal3.io/detached'
+        not in (bmh_managed.resources[0].metadata.annotations | default({}))
+      - >-
+        'bmac.agent-install.openshift.io/allow-provisioned-host-management'
+        in (bmh_managed.resources[0].metadata.annotations | default({}))
+    fail_msg: >-
+      Expected allow-provisioned-host-management and cleared paused/detached
+      annotations on {{ bmh_name }}.
+
+# ------------------------------------------------------------------
+# 3. Create HostUpdatePolicy CR (hub)
+# ------------------------------------------------------------------
+- name: "3. Apply HostUpdatePolicy ({{ bmh_name }})"
+  kubernetes.core.k8s:
+    state: present
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    definition: "{{ lookup('template', 'hostupdatepolicy.yml.j2') | from_yaml }}"
+
+# ------------------------------------------------------------------
+# 4. Patch HostFirmwareComponents (hub)
+# ------------------------------------------------------------------
+- name: "4. Patch HostFirmwareComponents with provided firmware URL(s) ({{ bmh_name }})"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: metal3.io/v1alpha1
+    kind: HostFirmwareComponents
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    merge_type: merge
+    definition:
+      spec:
+        updates: "{{ hfc_updates }}"
+
+# ------------------------------------------------------------------
+# 5. Verify ChangeDetected (hub)
+# ------------------------------------------------------------------
+- name: "5. Wait until HostFirmwareComponents reports ChangeDetected=True ({{ bmh_name }})"
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: HostFirmwareComponents
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: hfc
+  until: >-
+    (
+      hfc.resources[0].status.conditions
+      | default([])
+      | selectattr('type', 'equalto', 'ChangeDetected')
+      | map(attribute='status')
+      | list
+      | first
+      | default('False')
+    ) == 'True'
+  retries: "{{ change_detected_retries }}"
+  delay: "{{ change_detected_delay }}"
+
+- name: "5. Show ChangeDetected condition ({{ bmh_name }})"
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        hfc.resources[0].status.conditions
+        | selectattr('type', 'equalto', 'ChangeDetected')
+        | list
+        | first
+      }}
+
+# ------------------------------------------------------------------
+# 6. Reboot BMH from hub (optional cordon left commented)
+# ------------------------------------------------------------------
+# - name: "6. Cordon spoke node (spoke API; matches oc adm cordon) ({{ spoke_node_name }})"
+#   kubernetes.core.k8s:
+#     state: patched
+#     api_version: v1
+#     kind: Node
+#     name: "{{ spoke_node_name }}"
+#     host: "{{ spoke_auth_result.k8s_auth.host }}"
+#     username: "{{ spoke_auth_result.k8s_auth.username }}"
+#     api_key: "{{ spoke_auth_result.k8s_auth.api_key }}"
+#     validate_certs: false
+#     merge_type: merge
+#     definition:
+#       spec:
+#         unschedulable: true
+
+- name: "6. Trigger firmware update reboot on BMH (hub) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  kubernetes.core.k8s:
+    state: patched
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    definition:
+      metadata:
+        annotations:
+          reboot.metal3.io: ""
+
+- name: "6. Reminder — monitor remote console during BMC update ({{ bmh_name }})"
+  ansible.builtin.debug:
+    msg: >-
+      BMC connectivity may drop temporarily. Expect at least two reboots.
+      Watch the host remote console while servicing runs.
+
+- name: "6. Settle after reboot annotation (avoid instant OK/Ready false success) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  ansible.builtin.wait_for:
+    timeout: "{{ post_reboot_settle_seconds }}"
+
+- name: "6. Wait for BareMetalHost to enter servicing (hub) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: bmh_servicing
+  until: >-
+    (bmh_servicing.resources[0].status.operationalStatus | default('')) == 'servicing'
+  retries: "{{ servicing_retries }}"
+  delay: "{{ servicing_delay }}"
+
+- name: "6. Wait for BareMetalHost to leave servicing (OK or transient BMC teardown error) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: bmh_after
+  until: >-
+    ('reboot.metal3.io' not in (bmh_after.resources[0].metadata.annotations | default({})))
+    and
+    (
+      (
+        (bmh_after.resources[0].status.operationalStatus | default('')) == 'OK'
+        and
+        (bmh_after.resources[0].status.errorMessage | default('') | length) == 0
+      )
+      or
+      (
+        (bmh_after.resources[0].status.operationalStatus | default('')) == 'error'
+        and
+        (
+          ('VirtualMedia' in (bmh_after.resources[0].status.errorMessage | default('')))
+          or ('Failed to tear down from service' in (bmh_after.resources[0].status.errorMessage | default('')))
+          or ('ECONNREFUSED' in (bmh_after.resources[0].status.errorMessage | default('')))
+        )
+      )
+    )
+  retries: "{{ servicing_retries }}"
+  delay: "{{ servicing_delay }}"
+
+- name: "6. Note transient BMH error after BMC firmware (VirtualMedia teardown) ({{ bmh_name }})"
+  when:
+    - trigger_reboot | bool
+    - (bmh_after.resources[0].status.operationalStatus | default('')) == 'error'
+  ansible.builtin.debug:
+    msg: >-
+      BMH is in error after servicing (often expected while iDRAC restarts):
+      {{ bmh_after.resources[0].status.errorMessage | default('') }}
+      Continuing; will recheck BMH after the spoke node is Ready.
+
+- name: "6. Wait for HostFirmwareComponents ChangeDetected=False (hub) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: HostFirmwareComponents
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: hfc_after
+  until: >-
+    (
+      hfc_after.resources[0].status.conditions
+      | default([])
+      | selectattr('type', 'equalto', 'ChangeDetected')
+      | map(attribute='status')
+      | list
+      | first
+      | default('True')
+    ) == 'False'
+  retries: "{{ servicing_retries }}"
+  delay: "{{ servicing_delay }}"
+
+# ------------------------------------------------------------------
+# 7. Wait for spoke node Ready, then restore RHACM pause
+# ------------------------------------------------------------------
+- name: "7. Re-authenticate to spoke when API is reachable again ({{ spoke_node_name }})"
+  when: (restore_rhacm_pause | bool) or (uncordon_after_update | bool)
+  kubernetes.core.k8s_auth:
+    host: "{{ spoke_api_url }}"
+    password: "{{ spoke_password }}"
+    username: "{{ spoke_username }}"
+    state: present
+    validate_certs: false
+  register: spoke_auth_result
+  until: spoke_auth_result is succeeded
+  retries: "{{ spoke_ready_retries }}"
+  delay: "{{ spoke_ready_delay }}"
+
+- name: "7. Wait for spoke node to report Ready=True ({{ spoke_node_name }})"
+  when: (restore_rhacm_pause | bool) or (uncordon_after_update | bool)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    name: "{{ spoke_node_name }}"
+    host: "{{ spoke_auth_result.k8s_auth.host }}"
+    username: "{{ spoke_auth_result.k8s_auth.username }}"
+    api_key: "{{ spoke_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: spoke_node
+  until: >-
+    spoke_node.resources | default([]) | length == 1
+    and
+    (
+      spoke_node.resources[0].status.conditions
+      | default([])
+      | selectattr('type', 'equalto', 'Ready')
+      | map(attribute='status')
+      | list
+      | first
+      | default('False')
+    ) == 'True'
+  retries: "{{ spoke_ready_retries }}"
+  delay: "{{ spoke_ready_delay }}"
+
+- name: "7. Wait for BMH to recover to OK after BMC/iDRAC returns (hub) ({{ bmh_name }})"
+  when: trigger_reboot | bool
+  kubernetes.core.k8s_info:
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+  register: bmh_recovered
+  until: >-
+    (bmh_recovered.resources[0].status.operationalStatus | default('')) == 'OK'
+    and
+    (bmh_recovered.resources[0].status.errorMessage | default('') | length) == 0
+  retries: "{{ bmc_recover_retries }}"
+  delay: "{{ bmc_recover_delay }}"
+  ignore_errors: true
+
+- name: "7. Warn if BMH still in error after BMC recover wait ({{ bmh_name }})"
+  when:
+    - trigger_reboot | bool
+    - bmh_recovered is failed
+      or (bmh_recovered.resources[0].status.operationalStatus | default('')) != 'OK'
+  ansible.builtin.debug:
+    msg: >-
+      Spoke node is Ready and firmware likely applied, but BMH is still
+      {{ bmh_recovered.resources[0].status.operationalStatus | default('unknown') }}:
+      {{ bmh_recovered.resources[0].status.errorMessage | default('') }}
+      Wait for iDRAC/Redfish to come back; Metal3 often clears this once
+      VirtualMedia teardown can succeed. Proceeding with cleanup.
+
+- name: "7. Uncordon spoke node after update ({{ spoke_node_name }})"
+  when: uncordon_after_update | bool
+  kubernetes.core.k8s:
+    state: patched
+    api_version: v1
+    kind: Node
+    name: "{{ spoke_node_name }}"
+    host: "{{ spoke_auth_result.k8s_auth.host }}"
+    username: "{{ spoke_auth_result.k8s_auth.username }}"
+    api_key: "{{ spoke_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    merge_type: merge
+    definition:
+      spec:
+        unschedulable: false
+
+- name: "7. Remove allow-provisioned-host-management annotation ({{ bmh_name }})"
+  when: restore_rhacm_pause | bool
+  kubernetes.core.k8s:
+    state: patched
+    api_version: metal3.io/v1alpha1
+    kind: BareMetalHost
+    name: "{{ bmh_name }}"
+    namespace: "{{ cluster_namespace }}"
+    host: "{{ hub_auth_result.k8s_auth.host }}"
+    username: "{{ hub_auth_result.k8s_auth.username }}"
+    api_key: "{{ hub_auth_result.k8s_auth.api_key }}"
+    validate_certs: false
+    definition:
+      metadata:
+        annotations:
+          bmac.agent-install.openshift.io/allow-provisioned-host-management: null
+
+- name: "Firmware update finished ({{ bmh_name }} / {{ spoke_node_name }})"
+  ansible.builtin.debug:
+    msg: >-
+      Firmware update flow for {{ bmh_name }} in {{ cluster_namespace }} completed.

@@ -1,0 +1,45 @@
+---
+# Single-node firmware update (RH article 7138537).
+#
+# Usage:
+#   ansible-playbook playbook.yml -e @vars/main.yml
+#   ansible-playbook playbook.yml -e @vars/main.yml -e trigger_reboot=false
+#
+# For multiple spokes/nodes, use playbook-batch.yml instead.
+
+- name: Update spoke host firmware via RHACM hub + Metal3
+  hosts: localhost
+  gather_facts: false
+  become: false
+  connection: local
+  collections:
+    - kubernetes.core
+    - community.general
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Ensure required Ansible collections are installed
+      ansible.builtin.command:
+        cmd: ansible-galaxy collection list {{ item }}
+      loop:
+        - kubernetes.core
+        - community.general
+      register: collection_check
+      changed_when: false
+      failed_when: collection_check.rc != 0
+
+    - name: Authenticate to hub OpenShift using username/password
+      kubernetes.core.k8s_auth:
+        host: "{{ hub_api_url }}"
+        password: "{{ hub_password }}"
+        username: "{{ hub_username }}"
+        state: present
+        validate_certs: false
+      register: hub_auth_result
+      when: hub_username != "" and hub_password != "" and hub_api_url != ""
+
+    - name: Run firmware update for one BMH/node
+      ansible.builtin.include_role:
+        name: host_firmware_update

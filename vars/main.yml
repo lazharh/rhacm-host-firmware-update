@@ -1,0 +1,56 @@
+---
+# Single-node vars for playbook.yml. Based on RH article 7138537.
+# For multiple spokes, use vars/batch.yml with playbook-batch.yml.
+#
+# Prerequisites (manual / out of band):
+# - RHACM 2.14.1+ hub, RHOCP 4.18+ hub and spoke
+# - BIOS .EXE and BMC firmimgFIT.d9 hosted on HTTP(S)
+# - Hub cluster-admin credentials (and spoke credentials for cordon)
+
+# --- Hub (RHACM) login — same pattern as playbook-migrate-hub-to-siteconfig-operator.yml
+hub_api_url: "https://api.lzhacm.se-lab.eng.rdu2.dc.redhat.com:6443"
+### a cluster admin user is required.
+hub_username: "kubeadmin"
+hub_password: ""
+
+# --- Spoke login — used for cordon/uncordon
+spoke_api_url: "https://api.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com:6443"
+spoke_username: "kubeadmin"
+spoke_password: ""
+
+cluster_namespace: sno-hnn3sy3
+bmh_name: master-0.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com # from hub: oc get bmh -n $cluster_namespace
+spoke_node_name: master-0.sno-hnn3sy3.se-lab.eng.rdu2.dc.redhat.com # from spoke: oc get nodes
+
+# At least one of these must be set; leave the other empty to skip that component.
+bios_firmware_url: "http://refarch.se-apps.redhat.com//pub/firmware/dell/BIOS_DCFN9_WN64_1.21.1.EXE"
+bmc_firmware_url: "http://refarch.se-apps.redhat.com//pub/firmware/dell/iDRAC_7.30.30.51_A00/firmimgFIT.d9"
+
+# Wait timings (firmware updates often need multiple reboots + BMC reclaim)
+change_detected_retries: 30
+change_detected_delay: 10
+# ~2h for IPA/servicing / BMC flash teardown
+servicing_retries: 240
+servicing_delay: 30
+
+# After reboot.metal3.io: give BMO time to start before polling "OK"/"Ready"
+# (otherwise those checks succeed immediately while the node is still up)
+post_reboot_settle_seconds: 300
+
+# After BMH leaves servicing, wait for spoke API/node Ready (SNO can take a long time)
+# ~2h default
+spoke_ready_retries: 240
+spoke_ready_delay: 30
+
+# After spoke is Ready, keep polling BMH while iDRAC comes back from BMC flash
+bmc_recover_retries: 60
+bmc_recover_delay: 30
+
+# Set true only when you intend to reboot and apply firmware
+trigger_reboot: true
+
+# After success, remove allow-provisioned-host-management so RHACM re-pauses BMH
+restore_rhacm_pause: true
+
+# Uncordon after update (article leaves this implicit; recommended for day-2)
+uncordon_after_update: true
